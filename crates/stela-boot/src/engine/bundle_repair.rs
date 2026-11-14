@@ -66,6 +66,17 @@ pub(super) fn decide(report: Report) -> Decision {
         record,
         PERSISTENT.load(Ordering::Relaxed),
     );
+    // On a PC the guest console echoes typed bytes but its single-user shell
+    // never executes them: every repair command times out with no exit status
+    // (a plain /bin/test -d does too). So there is no point stopping or
+    // restarting. Let this boot reach multi-user, where the App's install job
+    // creates the plugin's directories, and forget the NVRAM request so the
+    // loader stops scheduling a repair boot that cannot work.
+    let decision = if matches!(report, Report::Missing) && this_boot() == Boot::Normal {
+        Decision::Continue(Some(Change::Forget))
+    } else {
+        decision
+    };
     let change = match decision {
         Decision::Repair => Some(Change::Request),
         Decision::Continue(change) => change,

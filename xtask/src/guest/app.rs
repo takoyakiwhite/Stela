@@ -338,6 +338,10 @@ fn script() -> String {
 new=/Applications/.Stela.app.new
 old=/Applications/.Stela.app.old
 archive={ARCHIVE}
+gpu=/Library/GPUBundles/StelaGPU.bundle
+/bin/mkdir -p -m 0755 "$gpu" "$gpu/Contents" "$gpu/Contents/MacOS"
+/usr/sbin/chown root:wheel "$gpu" "$gpu/Contents" "$gpu/Contents/MacOS"
+/usr/bin/chflags restricted "$gpu" "$gpu/Contents" "$gpu/Contents/MacOS" 2>/dev/null || true
 report=
 waited=0
 while [ "$waited" -lt {WAIT_SECONDS} ]; do
