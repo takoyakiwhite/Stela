@@ -1,0 +1,70 @@
+# Build a stela.efi with the CorruptContext fixes, without the release
+# workflow's tag/CLI/App chain. Stela.app is optional: xtask emits an
+# "absent" header when no package is present, and the kext installs no app.
+name: build-fixed-efi
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  efi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Clang 21
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-efi-fix-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'crates/stela-boot/Cargo.lock') }}
+          restore-keys: cargo-efi-fix-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          clang --version | head -1
+
+      - name: Fetch upstream sources
+        run: cargo xtask gpu fetch
+
+      - name: Build stela.efi
+        run: |
+          cargo xtask boot build --release
+          efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+          [[ "$(head -c 2 "$efi")" == MZ ]] || { echo "::error::$efi is not a PE image"; exit 1; }
+          mkdir -p dist
+          cp "$efi" dist/stela.efi
+          ls -l dist/stela.efi
+          sha256sum dist/stela.efi
+          strings -a dist/stela.efi | grep -m1 'STELA UEFI MOUNT version' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-efi
+          path: dist/stela.efi
+          if-no-files-found: error
+          retention-days: 14

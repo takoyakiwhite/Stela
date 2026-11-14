@@ -191,6 +191,12 @@ impl RootIdentity {
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
+        // A guest view runs in its own tagged TLB context (2..=CONTEXTS) over a
+        // root this engine owns. An interrupt delivered while one is loaded is
+        // ours to service; it is not a foreign root.
+        if (2..=crate::engine::host::CONTEXTS).contains(&(current & !ADDRESS)) {
+            return Ok(());
+        }
         if current & !ADDRESS != 0 || !self.roots.roots().contains(&current) {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
