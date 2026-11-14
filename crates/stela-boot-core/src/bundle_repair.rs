@@ -252,11 +252,11 @@ pub fn steps() -> Vec<Step> {
 /// The repair commands for Stela on a PC. [`steps`] follows the SEP device's
 /// single-user banner, but on a PC the guest has already mounted the Data
 /// volume before the shell appears (`apfs_boot_util`'s `mount_by_role`), so
-/// the SEP two-phase mount is unnecessary. Worse, `mount -P 1` reaches SEP
-/// credential manager commands this engine does not implement and never
-/// returns: the shell printed the typed line and then no exit status for the
-/// full 120 s. Only a read-write remount is needed before making the
-/// directories; the rest matches [`steps`].
+/// no mount is needed. Every `mount` command tried here (`mount -P 1`,
+/// `mount -uw /System/Volumes/Data`) reaches SEP credential manager commands
+/// this engine does not implement and never returns, so the shell prints the
+/// typed line but never the `echo` of its exit status. A repair boot on this
+/// machine must only make the directories; the rest matches [`steps`].
 pub fn pc_steps() -> Vec<Step> {
     let directories = DIRECTORIES
         .iter()
@@ -274,13 +274,11 @@ pub fn pc_steps() -> Vec<Step> {
         required: false,
     };
     Vec::from([
-        step("/sbin/mount -uw /System/Volumes/Data || /bin/true".into(), 60),
-        step(format!("/bin/test -d {PLUGINS}"), 30),
-        step(format!("/bin/mkdir -p -m 0755 {directories}"), 30),
-        step(format!("/usr/sbin/chown root:wheel {directories}"), 30),
-        optional(format!("/usr/bin/chflags restricted {directories}"), 30),
-        step("/bin/sync".into(), 120),
-        optional("/sbin/mount -u -r /System/Volumes/Data".into(), 60),
+        step(format!("/bin/test -d {PLUGINS}"), 15),
+        step(format!("/bin/mkdir -p -m 0755 {directories}"), 20),
+        step(format!("/usr/sbin/chown root:wheel {directories}"), 20),
+        optional(format!("/usr/bin/chflags restricted {directories}"), 15),
+        step("/bin/sync".into(), 60),
     ])
 }
 
