@@ -88,6 +88,10 @@ enum {
 	MTLGPUFamilyApple4 = 1004,
 	MTLGPUFamilyApple6 = 1006,
 	MTLGPUFamilyApple7 = 1007,
+	MTLGPUFamilyApple8 = 1008,
+	MTLGPUFamilyApple9 = 1009,
+	MTLGPUFamilyApple10 = 1010,
+	MTLGPUFamilyApple11 = 1011,
 	MTLGPUFamilyMac1 = 2001,
 	MTLGPUFamilyMac2 = 2002,
 };
