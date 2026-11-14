@@ -1,6 +1,6 @@
 # Build a stela.efi with the CorruptContext fixes, without the release
-# workflow's tag/CLI/App chain. Stela.app is optional: xtask emits an
-# "absent" header when no package is present, and the kext installs no app.
+# workflow's tag/CLI chain. Stela.app comes from the same macOS job the
+# release uses, so the kext carries the complete guest-side payload.
 name: build-fixed-efi
 
 on:
@@ -18,11 +18,42 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  app:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build Stela.app
+        run: |
+          swift --version
+          app="$(bash guest/stela-app/build.sh | tee /dev/stderr | tail -1)"
+          [[ -f "$app/Contents/Info.plist" ]] || { echo "::error::build.sh named no app bundle: $app"; exit 1; }
+          tar -C "$(dirname "$app")" -cf Stela.app.tar Stela.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-app
+          path: Stela.app.tar
+          if-no-files-found: error
+          retention-days: 7
+
   efi:
+    needs: app
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-app
+          path: app
+
+      - name: Unpack Stela.app
+        run: |
+          tar -C app -xf app/Stela.app.tar
+          echo "STELA_APP=$PWD/app/Stela.app" >> "$GITHUB_ENV"
 
       - name: Install Clang 21
         run: |
