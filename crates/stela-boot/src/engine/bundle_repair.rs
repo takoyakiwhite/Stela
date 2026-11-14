@@ -66,6 +66,18 @@ pub(super) fn decide(report: Report) -> Decision {
         record,
         PERSISTENT.load(Ordering::Relaxed),
     );
+    // An earlier repair that timed out on the PC's SEP two-phase mount left
+    // the record "attempted" without ever creating the directories. With the
+    // PC's own repair steps, give it one more repair instead of stopping on
+    // every later boot.
+    let decision = match decision {
+        Decision::StopMissing { attempted: true }
+            if this_boot() == Boot::Normal && PERSISTENT.load(Ordering::Relaxed) =>
+        {
+            Decision::Repair
+        }
+        decision => decision,
+    };
     let change = match decision {
         Decision::Repair => Some(Change::Request),
         Decision::Continue(change) => change,
@@ -137,6 +149,6 @@ pub(super) fn driver(now_millis: u64) -> Option<Driver> {
         output::arguments(format_args!(
             "BUNDLE REPAIR maintenance boot: single-user, filesystem protection off\n"
         ));
-        Driver::new(bundle_repair::steps(), now_millis)
+        Driver::new(bundle_repair::pc_steps(), now_millis)
     })
 }

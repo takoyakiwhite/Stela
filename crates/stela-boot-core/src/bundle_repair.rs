@@ -249,6 +249,41 @@ pub fn steps() -> Vec<Step> {
 /// stalled in single-user mode: run 20261111-150448 stopped in
 /// `vfs_unmountall(system)` at `unmount(0) /System/Volumes/xarts`, before
 /// APFS began that unmount, until the 300 s bound ran out.
+/// The repair commands for Stela on a PC. [`steps`] follows the SEP device's
+/// single-user banner, but on a PC the guest has already mounted the Data
+/// volume before the shell appears (`apfs_boot_util`'s `mount_by_role`), so
+/// the SEP two-phase mount is unnecessary. Worse, `mount -P 1` reaches SEP
+/// credential manager commands this engine does not implement and never
+/// returns: the shell printed the typed line and then no exit status for the
+/// full 120 s. Only a read-write remount is needed before making the
+/// directories; the rest matches [`steps`].
+pub fn pc_steps() -> Vec<Step> {
+    let directories = DIRECTORIES
+        .iter()
+        .map(|directory| format!("{PLUGINS}/{directory}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let step = |command: String, seconds| Step {
+        command,
+        seconds,
+        required: true,
+    };
+    let optional = |command: String, seconds| Step {
+        command,
+        seconds,
+        required: false,
+    };
+    Vec::from([
+        step("/sbin/mount -uw /System/Volumes/Data || /bin/true".into(), 60),
+        step(format!("/bin/test -d {PLUGINS}"), 30),
+        step(format!("/bin/mkdir -p -m 0755 {directories}"), 30),
+        step(format!("/usr/sbin/chown root:wheel {directories}"), 30),
+        optional(format!("/usr/bin/chflags restricted {directories}"), 30),
+        step("/bin/sync".into(), 120),
+        optional("/sbin/mount -u -r /System/Volumes/Data".into(), 60),
+    ])
+}
+
 pub const REBOOT: &str = "/sbin/reboot -q";
 /// What ends a repair whose required step failed: what was written stays.
 pub const SYNC_AND_REBOOT: &str = "/bin/sync; /sbin/reboot -q";
