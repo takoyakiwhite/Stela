@@ -215,6 +215,43 @@ pub(crate) fn wake() {
     }
 }
 
+/// This processor enters a terminal handler (#MC, #DF, an NMI that stops
+/// the boot), from which it never returns: flush what it skipped while
+/// idle and what is requested, and from then on take no retirement's NMI,
+/// which would interrupt a handler that cannot take one ([`Processors::enter_terminal`]).
+/// Takes no lock and allocates nothing.
+///
+/// [`Processors::enter_terminal`]: stela_boot_core::aperture::Processors::enter_terminal
+pub(crate) fn enter_terminal() {
+    wake();
+    service();
+    let Some(slot) = crate::engine::host::shootdown().0 else {
+        return;
+    };
+    PROCESSORS.enter_terminal(slot);
+    // A retirement that did not see the state waits no longer; this flushes
+    // what it requested.
+    service();
+}
+
+/// Whether this processor runs a terminal handler ([`enter_terminal`]).
+pub(crate) fn terminal_here() -> bool {
+    crate::engine::host::shootdown()
+        .0
+        .is_some_and(|slot| PROCESSORS.terminal(slot))
+}
+
+/// Before a stop draws its screen, which may reach the framebuffer through
+/// a window translation: flush what was retired since this processor last
+/// did, as no retirement waits for a processor in a terminal handler.
+/// Nothing before the engine requests a shootdown, so a stop before it
+/// does nothing here.
+pub(crate) fn before_stop_screen() {
+    if PROCESSORS.requested() != 0 {
+        service();
+    }
+}
+
 /// In this processor's NMI gate: whether a retirement sent the NMI
 /// ([`aperture::Processors::poke`]). The gate answers it ([`answer_nmi`])
 /// unless it is also the step watchdog's.

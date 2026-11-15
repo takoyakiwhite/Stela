@@ -42,8 +42,8 @@ const IST_BYTES: usize = 64 * 1024;
 // handler. Runtime/disassembly stack-budget validation remains a required gate.
 const HANDLER_STACK_BYTES: usize = 32 * 1024;
 
-use stela_boot_core::interrupt_image::Backing;
 pub use stela_boot_core::interrupt_image::Frame;
+use stela_boot_core::interrupt_image::{self, Backing};
 
 #[repr(C, packed)]
 struct TaskState {
@@ -67,8 +67,22 @@ pub(crate) struct Tables {
     gdt: [u64; 5],
     idt: [[u64; 2]; 256],
     fault_stack: Stack,
-    fatal_stack: Stack,
+    /// The terminal vectors' stacks: #DF, #MC and NMI each its own
+    /// ([`interrupt_image::ist`]), in [`interrupt_image::TERMINAL_VECTORS`]'
+    /// order of their IST indexes ([`terminal_index`]).
+    terminal_stacks: [Stack; 3],
 }
+
+/// The index in [`Tables::terminal_stacks`] of a terminal IST.
+const fn terminal_index(ist: u8) -> usize {
+    (ist - interrupt_image::DOUBLE_FAULT_IST) as usize
+}
+const _: () = assert!(
+    terminal_index(interrupt_image::DOUBLE_FAULT_IST) == 0
+        && terminal_index(interrupt_image::MACHINE_CHECK_IST) == 1
+        && terminal_index(interrupt_image::NMI_IST) == 2
+        && interrupt_image::ORDINARY_IST == 1
+);
 
 impl Tables {
     pub(crate) const fn new() -> Self {
@@ -87,7 +101,7 @@ impl Tables {
             gdt: [0, 0x00af_9a00_0000_ffff, 0x00cf_9200_0000_ffff, 0, 0],
             idt: [[0; 2]; 256],
             fault_stack: Stack::new(),
-            fatal_stack: Stack::new(),
+            terminal_stacks: [Stack::new(), Stack::new(), Stack::new()],
         }
     }
 }
@@ -360,8 +374,16 @@ stela_nmi_gate:
 
 /// Whether the NMI at `rip` was a shootdown's, now answered: the gate then
 /// returns. The step watchdog's keeps its stop even when a shootdown's came
-/// with it, as two NMIs pending at once are taken as one.
+/// with it, as two NMIs pending at once are taken as one. On a processor
+/// already in a terminal handler, which no retirement sends one to, an NMI
+/// (a platform's, or the step watchdog's for the step the handler
+/// interrupted) returns too: that handler's stop goes on and keeps its
+/// reason, where the NMI's terminal stub would find the terminal entry slot
+/// in use and halt.
 extern "sysv64" fn nmi_answer(rip: u64) -> bool {
+    if crate::native_mmio::shootdown::terminal_here() {
+        return true;
+    }
     if !crate::native_mmio::shootdown::take_poke() || super::step_watchdog::nmi_is_watchdog() {
         return false;
     }
@@ -441,6 +463,27 @@ const _: () = assert!(
         && SHOOTDOWN_VECTOR >> 4 > TIMER_VECTOR >> 4
         && TIMER_VECTOR < SPURIOUS_VECTOR
 );
+
+/// The timer and every device and completion vector are ordinary: they run
+/// on the ordinary interrupt stack and share its one entry slot, which the
+/// entry stub refuses to enter while it is in use. So no handler of theirs
+/// runs under another's, which the timer's ending of vectors left in
+/// service relies on (`host::timer_interrupt`).
+pub(crate) const ORDINARY_ENTRIES: () = {
+    let mut vector = 0x50;
+    while vector <= 0x5f {
+        assert!(interrupt_image::ist(vector) == interrupt_image::ORDINARY_IST);
+        vector += 1;
+    }
+    assert!(
+        interrupt_image::ist(TIMER_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(SIGNAL_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(NETWORK_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(SHOOTDOWN_VECTOR) == interrupt_image::ORDINARY_IST
+            && interrupt_image::ist(NATIVE_WAKE_VECTOR) == interrupt_image::ORDINARY_IST
+    );
+};
+const _: () = ORDINARY_ENTRIES;
 
 unsafe extern "C" {
     static stela_vector_table: [usize; VECTOR_NUMBERS.len()];
@@ -535,13 +578,13 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
     // captured and before anything on it saves extended state.
     unsafe { enable_avx() };
     // SAFETY: install_on owns this CPU and permanently pinned Tables,
-    // including both distinct IST arrays, before HostOwner or AP READY.
+    // including every distinct IST array, before HostOwner or AP READY.
     let owner = unsafe { super::xstate::XstateOwner::capture() }.unwrap_or_else(|error| {
         output::fatal(format_args!(
             "native IRQ state contract unavailable: {error:?}"
         ))
     });
-    for stack in [&tables.fault_stack, &tables.fatal_stack] {
+    for stack in core::iter::once(&tables.fault_stack).chain(&tables.terminal_stacks) {
         let bottom = stack.as_mut_ptr().addr();
         let top = bottom + IST_BYTES;
         let frame = top - size_of::<Frame>();
@@ -560,8 +603,12 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
     // SAFETY: all data here is private to this physical processor.
     unsafe {
         let tss = &raw mut tables.tss;
-        (*tss).ist[0] = (tables.fault_stack.as_mut_ptr() as u64) + IST_BYTES as u64;
-        (*tss).ist[1] = (tables.fatal_stack.as_mut_ptr() as u64) + IST_BYTES as u64;
+        let top = |stack: &Stack| stack.as_mut_ptr() as u64 + IST_BYTES as u64;
+        (*tss).ist[usize::from(interrupt_image::ORDINARY_IST) - 1] = top(&tables.fault_stack);
+        for vector in interrupt_image::TERMINAL_VECTORS {
+            let ist = interrupt_image::ist(vector);
+            (*tss).ist[usize::from(ist) - 1] = top(&tables.terminal_stacks[terminal_index(ist)]);
+        }
         let base = tss as u64;
         let limit = (size_of::<TaskState>() - 1) as u64;
         let gdt = &raw mut tables.gdt;
@@ -600,12 +647,14 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
         let idt = &raw mut tables.idt;
         let table = &stela_vector_table;
         for (&vector, &handler) in VECTOR_NUMBERS.iter().zip(table) {
-            // Double fault, NMI and machine check use their own stack.
-            let ist = if matches!(vector, 2 | 8 | 18) { 2 } else { 1 };
-            (*idt)[vector] = gate(handler, ist);
+            // Double fault, NMI and machine check each use their own stack.
+            (*idt)[vector] = gate(handler, interrupt_image::ist(vector as u8));
         }
         // An NMI first asks whether a shootdown sent it, then reaches its stub.
-        (*idt)[2] = gate(stela_nmi_gate as *const () as usize, 2);
+        (*idt)[2] = gate(
+            stela_nmi_gate as *const () as usize,
+            interrupt_image::NMI_IST,
+        );
         let pointer = Pointer {
             limit: (size_of::<[[u64; 2]; 256]>() - 1) as u16,
             base: idt as u64,
