@@ -273,6 +273,27 @@ impl AppleDevices {
         if matches!(device, Controller::V2(_)) {
             self.register_power_device(physical, id, false)?;
         }
+        self.watch_nor_claims();
         Ok(())
+    }
+
+    /// Once both an AICv2/v3 and the SPI NOR are placed, the AIC stamps its
+    /// claims of the NOR's interrupt for the NOR's activity
+    /// ([`crate::spi::Activity::claimed`]).
+    pub(super) fn watch_nor_claims(&mut self) {
+        let (Some(Controller::V2(aic)), Some(_)) = (self.aic, self.nor) else {
+            return;
+        };
+        let stamp = crate::aic::ClaimStamp::default();
+        let Some(spi) = self.nor_shared.as_ref() else {
+            return;
+        };
+        let input = spi.with(|spi| {
+            spi.watch_claims(stamp.clone());
+            spi.irq()
+        });
+        if let Some(aic) = self.bus.device_mut::<Aic2>(aic) {
+            aic.watch_claims(input, stamp);
+        }
     }
 }

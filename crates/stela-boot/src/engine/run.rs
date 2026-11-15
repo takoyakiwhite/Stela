@@ -1498,6 +1498,92 @@ impl Heartbeat {
                 for state in machine.devices.with(|devices| devices.usb_diagnostics()) {
                     output::arguments(format_args!("USB {state}\n"));
                 }
+                // The SPI NOR's work on every PE since the last beat: an
+                // NVRAM sync runs through it inside XNU's halt/restart timer.
+                if let Some(nor) = machine
+                    .devices
+                    .with(|devices| devices.take_nor_activity())
+                    .filter(|nor| nor.accesses != 0)
+                {
+                    let hz = stela_soc::counter::FREQUENCY_HZ;
+                    // Each wait split at the AIC's claim: rise to claim (the
+                    // host's delivery and the guest's masking), claim to the
+                    // driver's next access (the guest's handler and work
+                    // loop), the claiming PEs, and waits with no claim. Then
+                    // the accesses served under the controller's own lock and
+                    // those that found it held, the line changes handed to
+                    // the AIC, and the board holds that did it (host counter
+                    // ticks).
+                    let lock = host::COUNTER_HZ;
+                    let mut by_pe = alloc::string::String::new();
+                    for (pe, &count) in nor.claims_by_cpu.iter().enumerate() {
+                        if count != 0 {
+                            let sep = if by_pe.is_empty() { "" } else { "," };
+                            by_pe += &alloc::format!("{sep}{pe}:{count}");
+                        }
+                    }
+                    output::arguments(format_args!(
+                        "NOR SPI accesses={} commands={} bytes={} selected_ms={} interrupts={} \
+                         interrupt_wait_ms={} longest_interrupt_wait_us={} raised_in_access={} \
+                         claimed={} claim_ms={} longest_claim_us={} answer_ms={} \
+                         longest_answer_us={} by_raiser={} claims_by_pe={} unclaimed={} \
+                         unclaimed_ms={} own_accesses={} own_waits={} delivered={} locked={} \
+                         lock_waited_ms={} lock_held_ms={} longest_lock_held_us={}\n",
+                        nor.accesses,
+                        nor.commands,
+                        nor.bytes,
+                        nor.selected_ticks * 1000 / hz,
+                        nor.interrupts,
+                        nor.interrupt_ticks * 1000 / hz,
+                        nor.longest_interrupt_ticks * 1_000_000 / hz,
+                        nor.raised_in_access,
+                        nor.claimed,
+                        nor.claim_ticks * 1000 / hz,
+                        nor.longest_claim_ticks * 1_000_000 / hz,
+                        nor.answer_ticks * 1000 / hz,
+                        nor.longest_answer_ticks * 1_000_000 / hz,
+                        nor.claimed_by_raiser,
+                        if by_pe.is_empty() { "-" } else { &by_pe },
+                        nor.unclaimed,
+                        nor.unclaimed_ticks * 1000 / hz,
+                        nor.own_accesses,
+                        nor.own_waits,
+                        nor.delivered,
+                        nor.locked,
+                        nor.lock_waited_ticks * 1000 / lock,
+                        nor.lock_held_ticks * 1000 / lock,
+                        nor.longest_lock_held_ticks * 1_000_000 / lock,
+                    ));
+                }
+                // Deferred fast IPIs (XNU's wake of an idle core) fire when
+                // the devices are next advanced with time: how late they did.
+                if let Some(ipis) = machine
+                    .devices
+                    .with(|devices| devices.take_deferred_ipis())
+                    .filter(|ipis| ipis.sent != 0 || ipis.fired != 0)
+                {
+                    let hz = stela_soc::counter::FREQUENCY_HZ;
+                    output::arguments(format_args!(
+                        "FAST IPI deferred={} cancelled={} fired={} late_ms={} longest_late_us={}\n",
+                        ipis.sent,
+                        ipis.cancelled,
+                        ipis.fired,
+                        ipis.late_ticks * 1000 / hz,
+                        ipis.longest_late_ticks * 1_000_000 / hz,
+                    ));
+                }
+                // Sleeping PEs a wake kicked (an interrupt or IPI for an idle
+                // PE) and how long their host cores took to come back.
+                let (kicked, ticks, longest) = machine.devices.hub().take_wake_latency();
+                if let Some(average) = ticks.checked_div(kicked) {
+                    let micros =
+                        |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(host::COUNTER_HZ);
+                    output::arguments(format_args!(
+                        "PES WAKE kicked={kicked} average_us={} longest_us={}\n",
+                        micros(average),
+                        micros(longest),
+                    ));
+                }
                 survey_report(machine);
                 occupancy_report(machine, &mut self.occupancy);
                 let next = if self.beats.is_multiple_of(SUSPENSION_BEATS) {

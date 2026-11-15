@@ -332,6 +332,19 @@ pub struct Plan<'a> {
     pub last: Option<Commit>,
 }
 
+impl Plan<'_> {
+    /// The bytes of the blobs the plan writes: none of a dropped blob.
+    pub fn placed_bytes(&self) -> u64 {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Data { blob, .. } => self.blobs.get(*blob).map(Blob::length),
+                _ => None,
+            })
+            .sum()
+    }
+}
+
 /// First fit for `length` bytes among the data area of `end` bytes less
 /// `taken`, kept sorted.
 fn place(taken: &mut Vec<(u64, u64)>, end: u64, length: u64) -> Option<u64> {
@@ -531,6 +544,31 @@ pub fn plan<'a>(
         steps,
         dropped,
         last,
+    }
+}
+
+/// [`plan`] for `change`, or, when it drops a blob, for `whole`: the same
+/// content as one blob per kind, each replacing every committed blob of its
+/// kind. Blobs appended into the gaps between earlier ones can leave free
+/// space in no run long enough for a replacement; `whole` frees those blobs
+/// with the ones it replaces, so its blobs land in the space they leave.
+/// Its plan is taken only when it drops nothing.
+pub fn plan_or_rewrite<'a>(
+    current: Option<&Commit>,
+    domain: [u8; 8],
+    key: [u8; 32],
+    file_bytes: u64,
+    change: Change<'a>,
+    whole: impl FnOnce() -> Change<'a>,
+) -> Plan<'a> {
+    let planned = plan(current, domain, key, file_bytes, change);
+    if planned.dropped.is_empty() {
+        return planned;
+    }
+    let rewritten = plan(current, domain, key, file_bytes, whole());
+    match rewritten.dropped.is_empty() {
+        true => rewritten,
+        false => planned,
     }
 }
 

@@ -249,6 +249,22 @@ fn change(update: &pipeline_store::Update, committed: Option<&Commit>) -> Change
     change
 }
 
+/// The journal change that writes the store's content whole: all its NIR as
+/// one blob and `update`'s cache, each replacing every committed blob of its
+/// kind.
+fn whole(update: &pipeline_store::Update) -> Change<'static> {
+    let mut change = Change::default();
+    change.replace.push(NIR);
+    change
+        .blobs
+        .push(Blob::new(NIR, pipeline_store::all_nir(&update.key)));
+    if let Some(cache) = &update.cache {
+        change.replace.push(CACHE);
+        change.blobs.push(Blob::new(CACHE, cache.clone()));
+    }
+    change
+}
+
 impl Writer {
     /// The next update to write, planned, unless one runs or nothing is new.
     fn start(&mut self) -> bool {
@@ -258,12 +274,16 @@ impl Writer {
         let Some(update) = pipeline_store::update() else {
             return false;
         };
-        let plan = journal::plan(
+        // NIR pieces appended between the cache's earlier places can leave
+        // no run the newer cache fits in: then the cache and all the NIR are
+        // written again, each whole, in the space the old blobs leave.
+        let plan = journal::plan_or_rewrite(
             self.committed.as_ref(),
             DOMAIN,
             update.key.0,
             self.file_bytes,
             change(&update, self.committed.as_ref()),
+            || whole(&update),
         );
         if !plan.dropped.is_empty() {
             output::arguments(format_args!(
@@ -347,13 +367,8 @@ pub fn write() {
                 return Ok(bytes);
             }
             let running = writer.running.as_mut().expect("started");
-            bytes += running
-                .execution
-                .plan()
-                .blobs
-                .iter()
-                .map(Blob::length)
-                .sum::<u64>();
+            // A dropped blob is not written ("PIPELINES full" names it).
+            bytes += running.execution.plan().placed_bytes();
             let done = translations::with_store_file(NAME, |device, extents| {
                 let mut target = Direct { device, extents };
                 while !running.execution.advance(&mut target, PIECE_BYTES)? {}

@@ -30,7 +30,8 @@ pub(super) fn lock_timeout_arguments(tsc_hz: u64) -> String {
 /// `partition`: its macOS, its staged update or its recoveryOS.
 fn from_disk(
     partition: alloc::boxed::Box<dyn stela_drivers::block::BlockDevice>,
-    options: &Options,
+    options: &mut Options,
+    adopt_ecid: bool,
     bluetooth: bool,
     tsc_hz: u64,
 ) -> Vec<(String, Vec<u8>)> {
@@ -97,6 +98,7 @@ fn from_disk(
     } else {
         stela_boot_core::bundle_repair::Boot::Normal
     });
+    let mut ecid = options.ecid;
     let result = if options.upgrade {
         bundle::upgrade_from_disk(partition, options.boot_volume, &defaults)
     } else if let Some(kind) = options.recovery {
@@ -106,14 +108,25 @@ fn from_disk(
         let request = installed::Request {
             volume: options.boot_volume,
             kexts: &kexts,
+            adopt_ecid,
             ..installed::Request::default()
         };
         let mut defaults = defaults;
         if options.safe_boot {
             defaults.boot_args.push_str(" -x");
         }
-        bundle::from_disk(partition, &request, &defaults)
+        bundle::from_disk(partition, &request, &defaults).map(|(files, own)| {
+            ecid = own;
+            files
+        })
     };
+    if ecid != options.ecid {
+        output::arguments(format_args!(
+            "IDENTITY the installed macOS's boot ticket names another ECID than this USB's \
+             options, which a USB made again has: this start uses the install's\n"
+        ));
+        options.ecid = ecid;
+    }
     let files = result.unwrap_or_else(|error| {
         output::fatal(format_args!(
             "no boot bundle could be built from the Preboot volume: {error}"
@@ -223,6 +236,11 @@ fn start(handoff: u64) -> Started {
             lines,
         )
     });
+    // SAFETY: CPL0 on the boot processor, which runs PE 0, with interrupts
+    // off and its descriptors installed; nothing else writes its P-state
+    // registers. After the stop record is armed, so that a fault here
+    // leaves its report. The APs ask for theirs when they are ready.
+    unsafe { stela_boot_core::host_performance::request_full_performance() };
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
     // satisfy higher-order CPU/physical page alignment simultaneously.
@@ -264,6 +282,10 @@ fn start(handoff: u64) -> Started {
         handoff.tsc_tolerance_ppm,
     );
     crate::status::set_clock(handoff.tsc_hz);
+    // Before any AP agrees with the BSP through a software offset: from
+    // then on the drivers' times and deadlines read the BSP's counter on
+    // every core, as the engine's own reads do.
+    stela_drivers::on_counter(super::host::rdtsc);
     stela_drivers::on_wait(crate::status::tick);
     stela_drivers::on_work(device_starting);
     stela_drivers::budget::on_processor(processor_gs);
@@ -456,10 +478,41 @@ fn open_host(
             &reason.to_string().replace('\n', " "),
         ));
     }
+    // An installed macOS starts only as the machine it was installed as,
+    // which its machine state names; the USB's `--ecid` is its own, for the
+    // installs it makes, and differs when the USB was made again since.
+    let mut named = false;
+    if devices.preboot.is_some() && options.install.is_none() && options.nor.is_some() {
+        let at = match state_in_storage {
+            true => 0,
+            false => {
+                usize::from(options.storage.is_some())
+                    + usize::from(options.restore_source.is_some())
+            }
+        };
+        let recorded = devices
+            .services
+            .get_mut(at)
+            .and_then(|device| nor::recorded_ecid(&mut **device, state_in_storage));
+        named = recorded.is_some();
+        if let Some(recorded) = recorded
+            && options.ecid != Some(recorded)
+        {
+            output::arguments(format_args!(
+                "IDENTITY the installed macOS's machine state names another ECID than this \
+                 USB's options, which a USB made again has: this start uses the install's\n"
+            ));
+            options.ecid = Some(recorded);
+        }
+    }
+    // A machine state from before it named its ECID: the system's own boot
+    // ticket names it.
+    let adopt_ecid = !named && options.install.is_none();
     let built = devices.preboot.take().map(|partition| {
         from_disk(
             partition,
             options,
+            adopt_ecid,
             devices.host_bluetooth.is_some(),
             handoff.tsc_hz,
         )
@@ -648,6 +701,21 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
         ));
         let mut opened = nor::HostNor::open(device);
         crate::status::done("");
+        // Before macOS starts: its `seputil` ends without a reason on a
+        // machine that is not the one it was installed as, and the kernel
+        // panics on that.
+        if options.install.is_none()
+            && let Some(ecid) = options.ecid
+            && let Ok(stela_soc::machine::sep_state::Owner::Other(_)) =
+                stela_soc::machine::sep_state::owner(&opened.3, ecid)
+        {
+            output::fatal(
+                "this macOS was installed by a Stela USB with another machine identity (ECID) \
+                 than this USB's, and neither its machine state nor its boot ticket names the \
+                 one it was installed as. Start it with the USB that installed it, or run \
+                 Install macOS, which replaces it.",
+            );
+        }
         bundle_repair::nvram(&opened.2.proxy);
         bundle_repair::take(&mut opened.0, &mut opened.1, &mut opened.2);
         opened
@@ -846,6 +914,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     output::arguments(format_args!(
         "NATIVE ACTIVE workers={active_workers} parked=0 source_PEs={}\n",
         full_profile.processors.len().max(1),
+    ));
+    output::arguments(format_args!(
+        "{}",
+        stela_boot_core::host_performance::summary()
     ));
     if loaded_tree.is_some() {
         crate::status::begin("Setting up the Mac's hardware");
@@ -1265,6 +1337,17 @@ fn start_machine(boot: Boot<'_>, parts: MachineParts) -> ! {
     // they are stale diagnostics, not coherent source-state receipts.
     hub.set_source_observations(options.profile);
     gpu::set_hub(hub.clone(), boot_processor);
+    // The guest network's receive signal goes, once the guest's link is up,
+    // to the last PE's core: macOS runs the lower PEs first and leaves the
+    // last one mostly waiting, so it takes the interrupt at once, where the
+    // boot PE takes it only between its slices.
+    if let Some(binding) = worker_bindings.iter().max_by_key(|binding| binding.pe)
+        && let Some(&selected) = capture.selected.get(binding.worker.0)
+        && let Some(processor) = capture.processors.get(selected as usize)
+        && binding.worker.0 != 0
+    {
+        network::set_receive_core(processor.apic_id);
+    }
     let devices = parallel::Board::new(devices, hub.clone());
     let settings = parallel::Settings {
         traces: options.traces.clone(),
@@ -2616,6 +2699,10 @@ fn start_platform(
         }
     };
     crate::status::progress("ACPI tables");
+    // The step watchdog's stop names this step: its AML calls are bounded
+    // (`aml::bounded`), but an access that never completes is not.
+    static ACPI_TABLES: &str = "the firmware's ACPI tables";
+    super::step_watchdog::stage(&ACPI_TABLES);
     let host_acpi = aml::HostAcpi::start(
         handoff.rsdp,
         handoff.root,
@@ -2632,6 +2719,7 @@ fn start_platform(
     crate::native_idle::install(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
     );
+    super::step_watchdog::clear_stage();
     crate::status::done("");
     Platform {
         acpi: host_acpi,
@@ -2820,6 +2908,9 @@ fn start_devices(
             let bsp = native_processors.expect("validated native roster");
             let bsp_apic = bsp.processors[bsp.selected[0] as usize].apic_id;
             storage_handoff.completion = host::completion_signal(bsp_apic);
+            // Frames reaching a host network adapter make the host's service
+            // due on a vector of their own (`host::network_signal`).
+            storage_handoff.network = host::network_signal(bsp_apic);
             // A disk step given up to another core's hold wakes it too.
             storage::ring_owed_steps_at(bsp_apic);
             #[cfg(feature = "diagnostics")]

@@ -4923,5 +4923,29 @@
     "kind": "manual",
     "inputs": [],
     "reason": "needs a supported host Clang and llvm-nm; simulates a distribution Clang that hardens by default; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "time_compare_loop",
+    "source": "crates/stela-compiler/src/x86_64/block/flag_cost_tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of a compare-and-branch loop run as the engine runs a self-loop; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "scanner_time_on_this_host",
+    "source": "crates/stela-compiler/src/x86_64/chain/tests/transfers.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of block transfers on this host; run on request"
+  },
+  {
+    "package": "stela-soc",
+    "test": "nor_access_cost",
+    "source": "crates/stela-soc/src/machine/tests.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing of SPI NOR register accesses through the board and through the device's own lock; run on request"
   }
 ]

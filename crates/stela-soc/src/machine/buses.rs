@@ -101,16 +101,25 @@ impl AppleDevices {
     /// external CS requires the placed GPIO bank.
     pub fn add_spi_nor(&mut self, placement: &stela_soc_data::board::SpiNor) -> Result<()> {
         let device = placement.device;
-        let spi = self.bus.add(Box::new(Spi::new(
-            placement.image.clone(),
-            AicInput::new(0, device.irq as u16),
-            placement.select.is_some(),
-        )));
+        // Behind its own lock: XNU's PIO loop reaches it hundreds of
+        // thousands of times per NVRAM sync ([`own_lock`]).
+        let shared = own_lock::Shared::new(
+            Spi::new(
+                placement.image.clone(),
+                AicInput::new(0, device.irq as u16),
+                placement.select.is_some(),
+            ),
+            device.physical,
+            device.bytes,
+        );
+        let spi = self.bus.add(Box::new(own_lock::Port(Arc::clone(&shared))));
+        self.nor_shared = Some(shared);
         self.bus
             .map(spi, device.physical, device.bytes, 0)
             .map_err(|e| refuse!("SPI placement: {e}", ?e))?;
         self.register_power_device(device.physical, spi, false)?;
         self.nor = Some(spi);
+        self.watch_nor_claims();
         if let Some(pin) = placement.select {
             let (base, _) = self
                 .gpio

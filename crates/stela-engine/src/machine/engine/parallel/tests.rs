@@ -1202,12 +1202,17 @@ struct Pending {
     starts: Vec<Start>,
     service: bool,
     register_calls: usize,
+    /// Each release of the board's lock: what its call waited and held.
+    released: Vec<(u64, u64)>,
 }
 
 /// The one IMPLEMENTATION DEFINED register [`Pending`] serves.
 const SERVED: Encoding = Encoding::new(3, 5, 15, 0, 1);
 
 impl Devices for Pending {
+    fn lock_released(&mut self, waited: u64, held: u64) {
+        self.released.push((waited, held));
+    }
     fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
         Ok(0)
     }
@@ -1428,6 +1433,47 @@ fn a_handle_counts_the_ticks_it_waited_for_the_lock() {
     let (waited, again) = waiter.join().unwrap();
     assert!(waited > 0);
     assert_eq!(again, 0);
+}
+
+/// Each call tells the devices, before it releases the board's lock, the
+/// ticks it waited for it and held it, as the lock's own counts have them,
+/// so a model can count them against what the call touched.
+#[test]
+fn each_call_tells_the_devices_its_lock_wait_and_hold() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let hub = Hub::new(2, Ticks(reads));
+    let home = SharedDevices::new(Pending::default(), hub);
+    let mut worker = home.worker();
+    worker.write(1, 0, 4, 0, 0).unwrap();
+    let released = |home: &SharedDevices<Pending>| home.with(|d| d.released.clone());
+    let access = |home: &SharedDevices<Pending>| home.lock_times()[Call::Access as usize].held;
+    let held = access(&home);
+    assert!(held > 0);
+    assert_eq!(released(&home).last(), Some(&(0, held)), "uncontended");
+    let board = Arc::clone(&home.board);
+    let locked = board.devices.lock().unwrap();
+    let waiter = std::thread::spawn(move || {
+        worker.write(1, 0, 4, 0, 0).unwrap();
+        worker.take_lock_wait()
+    });
+    // Bounded: the waiter blocks on the lock within five seconds.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while board.waits[Call::Access as usize].load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the waiter never waited"
+        );
+        std::thread::yield_now();
+    }
+    drop(locked);
+    let waited = waiter.join().unwrap();
+    assert!(waited > 0);
+    let all = released(&home);
+    assert_eq!(
+        all.last(),
+        Some(&(waited, access(&home) - held)),
+        "its own wait"
+    );
 }
 
 #[test]
@@ -2161,6 +2207,121 @@ fn a_pe_advances_the_devices_once_their_deadline_passed_while_home_is_outside() 
     assert_eq!(worker.deadline(60), None);
     assert_eq!(advances(&home), before + 3);
     assert!(worker.lines(1, 60).irq);
+}
+
+/// The host ticks from the first wake that kicks a sleeping PE to the end
+/// of its sleep are counted; a sleep nobody kicked, and a later kick in
+/// the same sleep, add nothing.
+#[test]
+fn a_kicked_sleep_counts_its_wake_latency() {
+    struct Ticking(AtomicU64);
+    impl Kick for Ticking {
+        fn kick(&self, _pe: usize) {}
+        fn ticks(&self) -> u64 {
+            self.0.fetch_add(10, Ordering::Relaxed) + 10
+        }
+    }
+    let hub = Hub::new(2, Ticking(AtomicU64::new(0)));
+    let epoch = hub.lines_epoch(1);
+    // Kicked at tick 10 (and again at 20), awake at 30.
+    hub.sleep(1, epoch, true, || {
+        hub.wake(1);
+        hub.wake(1);
+    });
+    hub.sleep(1, epoch, true, || {});
+    assert_eq!(hub.take_wake_latency(), (1, 20, 20));
+    assert_eq!(hub.take_wake_latency(), (0, 0, 0));
+    // A wake of a PE that does not sleep kicks nothing and counts nothing.
+    hub.wake(1);
+    hub.sleep(1, epoch, true, || {});
+    assert_eq!(hub.take_wake_latency(), (0, 0, 0));
+}
+
+/// A signal armed for a PE that comes due by itself (an Apple deferred fast
+/// IPI) bounds how long that PE's machine trusts its lines, and once due
+/// the PE advances the devices itself, while home runs its own loop: it
+/// fires then, not at home's next advance, which can be milliseconds on.
+#[test]
+fn a_pe_fires_its_own_due_signal_without_waiting_for_home() {
+    struct Own(Arc<AtomicU64>);
+    impl LocalRegisters for Own {
+        fn register(&self, _: Encoding, _: Option<u64>) -> Option<u64> {
+            None
+        }
+        fn storage(&self, _: Encoding) -> Option<u64> {
+            None
+        }
+        fn deadline(&self) -> Option<u64> {
+            let due = self.0.load(Ordering::SeqCst);
+            (due != 0).then_some(due)
+        }
+    }
+    /// PE 1's IRQ rises once an advance passes the armed count.
+    struct Deferred {
+        due: Arc<AtomicU64>,
+        raised: bool,
+        advanced_by: Vec<usize>,
+    }
+    impl Devices for Deferred {
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Ok(0)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn local_registers(&self, _: usize) -> Option<Arc<dyn LocalRegisters>> {
+            Some(Arc::new(Own(Arc::clone(&self.due))))
+        }
+        fn lines_and_deadline(&mut self, cpu: usize, now: u64) -> (Lines, Option<u64>) {
+            self.advanced_by.push(cpu);
+            let due = self.due.load(Ordering::SeqCst);
+            if due != 0 && now >= due {
+                self.due.store(0, Ordering::SeqCst);
+                self.raised = true;
+            }
+            (self.pins(cpu).unwrap_or_default(), None)
+        }
+        fn lines(&mut self, cpu: usize, now: u64) -> Lines {
+            self.lines_and_deadline(cpu, now).0
+        }
+        fn pins(&mut self, pe: usize) -> Option<Lines> {
+            Some(Lines {
+                irq: pe == 1 && self.raised,
+                ..Lines::default()
+            })
+        }
+    }
+    let (hub, _) = hub(2);
+    let due = Arc::new(AtomicU64::new(0));
+    let home = SharedDevices::new(
+        Deferred {
+            due: Arc::clone(&due),
+            raised: false,
+            advanced_by: Vec::new(),
+        },
+        Arc::clone(&hub),
+    );
+    let mut worker = home.worker();
+    let advanced = |home: &SharedDevices<Deferred>| {
+        home.with(|devices| core::mem::take(&mut devices.advanced_by))
+    };
+    advanced(&home);
+    // Nothing armed: the worker looks again in its usual time.
+    let look = worker.lines_and_deadline(1, 10).1.unwrap() - 10;
+    // Armed for count 50: the worker trusts its lines no later than that
+    // and advances nothing before.
+    due.store(50, Ordering::SeqCst);
+    assert_eq!(worker.own_deadline(1), Some(50));
+    let (lines, until) = worker.lines_and_deadline(1, 20);
+    assert_eq!((lines.irq, until), (false, Some(50.min(20 + look))));
+    assert!(advanced(&home).is_empty());
+    // Due, with home in its run loop: the worker advances them as PE 1 and
+    // reads its IRQ at once.
+    assert!(!hub.home_outside());
+    let (lines, _) = worker.lines_and_deadline(1, 50);
+    assert!(lines.irq);
+    assert_eq!(advanced(&home), [1]);
+    assert_eq!(worker.own_deadline(1), None);
 }
 
 #[test]
@@ -4045,4 +4206,177 @@ fn a_serving_pe_waits_for_a_line_change_only_while_it_takes_a_line() {
         });
         assert_eq!(pending, expected, "DAIF {daif:#x}, waiting {wait}");
     }
+}
+
+/// Registers at [`OWN`] served under their own lock: a read gives how many
+/// writes came before it; a write of 1 raises PE 1's IRQ and of 0 lowers
+/// it, each change queued for the board.
+const OWN: u64 = 0x9000;
+
+#[derive(Default)]
+struct OwnRegisters {
+    writes: AtomicU64,
+    queued: std::sync::Mutex<Vec<bool>>,
+}
+
+impl super::super::OwnLockRegisters for OwnRegisters {
+    fn serves(&self, physical: u64) -> bool {
+        (OWN..OWN + 0x100).contains(&physical)
+    }
+    fn read(&self, _: usize, _: u64, _: u8, _: u64) -> super::super::OwnLockAccess<u64> {
+        super::super::OwnLockAccess {
+            result: Ok(self.writes.load(Ordering::SeqCst)),
+            queued: false,
+        }
+    }
+    fn write(
+        &self,
+        _: usize,
+        _: u64,
+        _: u8,
+        value: u64,
+        _: u64,
+    ) -> super::super::OwnLockAccess<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.queued.lock().unwrap().push(value == 1);
+        super::super::OwnLockAccess {
+            result: Ok(()),
+            queued: true,
+        }
+    }
+}
+
+/// A board whose only interrupt is [`OwnRegisters`]'s, to PE 1.
+struct OwnBoard {
+    own: Arc<OwnRegisters>,
+    irq: bool,
+    deliveries: usize,
+}
+
+impl Devices for OwnBoard {
+    fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+        Ok(0)
+    }
+    fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+        Ok(())
+    }
+    fn lines(&mut self, pe: usize, _: u64) -> Lines {
+        Lines {
+            irq: pe == 1 && self.irq,
+            ..Lines::default()
+        }
+    }
+    fn own_lock_registers(&self) -> Option<Arc<dyn super::super::OwnLockRegisters>> {
+        Some(Arc::clone(&self.own) as Arc<dyn super::super::OwnLockRegisters>)
+    }
+    fn deliver_own(&mut self) -> Result<bool, DeviceError> {
+        let queued = core::mem::take(&mut *self.own.queued.lock().unwrap());
+        let Some(&last) = queued.last() else {
+            return Ok(false);
+        };
+        self.irq = last;
+        self.deliveries += 1;
+        Ok(true)
+    }
+}
+
+fn own_board() -> (SharedDevices<OwnBoard>, Arc<OwnRegisters>) {
+    let (hub, _) = hub(2);
+    let own = Arc::new(OwnRegisters::default());
+    let home = SharedDevices::new(
+        OwnBoard {
+            own: Arc::clone(&own),
+            irq: false,
+            deliveries: 0,
+        },
+        hub,
+    );
+    (home, own)
+}
+
+/// An access under its device's own lock that changes no line takes no
+/// board lock: it completes while another PE holds the board. One that
+/// queues a line change waits for the board, which hands the change on and
+/// tells the PE it reached before the access completes.
+#[test]
+fn an_own_lock_access_takes_the_board_only_to_hand_on_a_line_change() {
+    let (home, own) = own_board();
+    let mut worker = home.worker();
+    let board = Arc::clone(&home.board);
+    let hub = Arc::clone(home.hub());
+    let held = board.devices.lock().unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        let read = worker.read_scalar(0, OWN, 4, 10);
+        sent.send(matches!(read, ScalarRead::Served(Ok(0))))
+            .unwrap();
+        let written = worker.write_own(0, OWN + 4, 4, 1, 20);
+        sent.send(written == Some(Ok(()))).unwrap();
+        worker
+    });
+    let bound = std::time::Duration::from_secs(5);
+    assert_eq!(
+        received.recv_timeout(bound),
+        Ok(true),
+        "read beside the held board"
+    );
+    // Bounded: the write queues its change within five seconds, then waits.
+    let deadline = std::time::Instant::now() + bound;
+    while own.writes.load(Ordering::SeqCst) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the write never ran");
+        std::thread::yield_now();
+    }
+    assert!(
+        received
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "the write waits for the board to hand its change on"
+    );
+    let epoch = hub.inboxes[1].lines.load(Ordering::SeqCst);
+    drop(held);
+    assert_eq!(received.recv_timeout(bound), Ok(true));
+    let mut worker = waiter.join().unwrap();
+    assert!(
+        hub.inboxes[1].lines.load(Ordering::SeqCst) > epoch,
+        "PE 1 told"
+    );
+    assert_eq!(
+        home.with(|devices| (devices.irq, devices.deliveries)),
+        (true, 1)
+    );
+    // A read changes nothing on the board; a lowering write hands on again.
+    assert!(matches!(
+        worker.read_scalar(0, OWN, 4, 30),
+        ScalarRead::Served(Ok(1))
+    ));
+    assert_eq!(worker.write(0, OWN + 4, 4, 0, 40), Ok(()));
+    assert_eq!(
+        home.with(|devices| (devices.irq, devices.deliveries)),
+        (false, 2)
+    );
+    // Another address takes the board's own path.
+    assert_eq!(worker.write_own(0, 0x40, 4, 1, 50), None);
+}
+
+/// Every hold of the board's lock begins by handing on what own-lock
+/// accesses queued, and tells the PEs it reached, whatever its call: a
+/// change queued before any other call is seen by that call.
+#[test]
+fn every_board_hold_hands_on_queued_line_changes_first() {
+    let (home, own) = own_board();
+    let hub = Arc::clone(home.hub());
+    // Queued by the device directly, as an access that has not reached
+    // the board yet would leave it.
+    own.queued.lock().unwrap().push(true);
+    let epoch = hub.inboxes[1].lines.load(Ordering::SeqCst);
+    assert_eq!(
+        home.with(|devices| (devices.irq, devices.deliveries)),
+        (true, 1)
+    );
+    assert!(
+        hub.inboxes[1].lines.load(Ordering::SeqCst) > epoch,
+        "PE 1 told"
+    );
+    // Nothing waits now: a hold hands on nothing.
+    assert_eq!(home.with(|devices| devices.deliveries), 1);
 }
