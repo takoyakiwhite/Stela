@@ -1,0 +1,133 @@
+# Build the unmodified upstream main tree into a stela.efi artifact.
+#
+# This branch carries NO source changes: upstream main already contains the
+# CorruptContext, CR4, bundle-repair and display fixes. The workflow is build
+# infrastructure only and is deliberately kept out of the PR branch
+# (pr/clean-latest), which is a byte-for-byte mirror of upstream main.
+#
+# The two jobs mirror upstream's release.yml: Stela.app is built on macOS and
+# passed to the Linux EFI build as STELA_APP so the kext carries the complete
+# guest-side payload. The tag/CLI/release chain is skipped.
+name: build-upstream-latest
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  app:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build Stela.app
+        run: |
+          swift --version
+          app="$(bash guest/stela-app/build.sh | tee /dev/stderr | tail -1)"
+          [[ -f "$app/Contents/Info.plist" ]] || { echo "::error::build.sh named no app bundle: $app"; exit 1; }
+          tar -C "$(dirname "$app")" -cf Stela.app.tar Stela.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-app
+          path: Stela.app.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  efi:
+    needs: app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-app
+          path: app
+
+      - name: Unpack Stela.app
+        run: |
+          tar -C app -xf app/Stela.app.tar
+          echo "STELA_APP=$PWD/app/Stela.app" >> "$GITHUB_ENV"
+
+      - name: Install Clang 21
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-efi-upstream-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'crates/stela-boot/Cargo.lock') }}
+          restore-keys: cargo-efi-upstream-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          clang --version | head -1
+
+      - name: Cache keys
+        id: keys
+        run: |
+          pins="$(git ls-tree HEAD third_party | sha256sum | cut -c1-16)"
+          tools="$(printf '%s\n%s\n' "$(clang --version | head -1)" "$(rustc --version)" | sha256sum | cut -c1-16)"
+          echo "nvk=$pins-$tools" >> "$GITHUB_OUTPUT"
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: .tools/gpu
+          key: gpu-tools-${{ steps.keys.outputs.image }}-${{ hashFiles('xtask/src/gpu/toolchain.rs') }}
+
+      - uses: actions/cache@v4
+        id: nvk
+        with:
+          path: target/gpu
+          key: nvk-${{ steps.keys.outputs.nvk }}-${{ hashFiles('xtask/src/gpu/**', 'crates/stela-driver-gpu/**', 'third_party/patches/**', 'third_party/*.sparse') }}
+
+      - name: Fetch upstream sources
+        run: cargo xtask gpu fetch
+
+      - name: Keep the restored Mesa and LLVM build current
+        if: steps.nvk.outputs.cache-hit == 'true'
+        run: |
+          find third_party crates/stela-driver-gpu -path '*/.git' -prune -o -type f -print0 \
+            | xargs -0 touch -h -d '2000-01-01T00:00:00Z'
+
+      - name: Build stela.efi
+        run: |
+          cargo xtask boot build --release
+          efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+          [[ "$(head -c 2 "$efi")" == MZ ]] || { echo "::error::$efi is not a PE image"; exit 1; }
+          mkdir -p dist
+          cp "$efi" dist/stela.efi
+          ls -l dist/stela.efi
+          sha256sum dist/stela.efi
+          strings -a dist/stela.efi | grep -m1 'STELA UEFI MOUNT version' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-efi
+          path: dist/stela.efi
+          if-no-files-found: error
+          retention-days: 14
