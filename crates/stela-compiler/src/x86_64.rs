@@ -1596,6 +1596,8 @@ impl Emitter {
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod exit_boundary_tests;
 #[cfg(test)]
 mod range_check_tests;
 #[cfg(test)]

@@ -20,6 +20,10 @@ pub(super) const NBASE_INTERRUPT_STATUS: usize = 0x3c;
 pub(super) const RX_OK: u16 = 1 << 0;
 pub(super) const RX_ERROR: u16 = 1 << 1;
 pub(super) const LINK_CHANGE: u16 = 1 << 5;
+/// Interrupt events: no receive descriptor was the device's (Linux
+/// `RxOverflow`), and the receive FIFO overflowed (`RxFIFOOver`).
+pub(super) const RX_DESCRIPTORS_EMPTY: u16 = 1 << 4;
+pub(super) const RX_FIFO_OVERFLOW: u16 = 1 << 6;
 pub(super) const NBASE_TX_POLL: usize = 0x90;
 pub(super) const NBASE_MAC0_BACKUP: usize = 0x19e0;
 pub(super) const NBASE_RSS: usize = 0x4500;
@@ -121,7 +125,11 @@ pub(super) const OWN: u32 = 1 << 31;
 pub(super) const END: u32 = 1 << 30;
 pub(super) const FIRST: u32 = 1 << 29;
 pub(super) const LAST: u32 = 1 << 28;
+/// Receive status: RxRES, the error summary, set with any of RxRWT (bit
+/// 22), RxRUNT (bit 20) and RxCRC (bit 19), which say which error it was.
+pub(super) const RX_RES: u32 = 1 << 21;
 /// Receive status: RxRWT, RxRES, RxRUNT and RxCRC.
+#[cfg(test)]
 pub(super) const RX_ERRORS: u32 = 0xf << 19;
 /// Received length with the FCS (Linux `GENMASK(13, 0)`); bits 14..16
 /// above it are checksum results.

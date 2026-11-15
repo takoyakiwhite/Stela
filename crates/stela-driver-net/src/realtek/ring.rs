@@ -15,6 +15,9 @@ pub(super) struct Ring {
     pub descriptors: DmaBuffer,
     buffers: DmaBuffer,
     next: usize,
+    /// Completed receive descriptors taken, and those of them dropped.
+    pub taken: u64,
+    pub dropped: u64,
 }
 impl Ring {
     pub fn new(dma: &mut dyn DmaAllocator, wide: bool) -> Result<Self, BlockError> {
@@ -31,6 +34,8 @@ impl Ring {
             descriptors,
             buffers,
             next: 0,
+            taken: 0,
+            dropped: 0,
         })
     }
     pub fn initialize(&mut self, receive: bool) {
@@ -52,6 +57,23 @@ impl Ring {
         fence(Ordering::Release);
         self.descriptors
             .write(index * DESCRIPTOR, OWN | end(index) | BUFFER as u32);
+    }
+    /// The next slot the driver looks at.
+    pub fn next(&self) -> usize {
+        self.next
+    }
+    /// Whether the device owns each of the `N` slots from the next one.
+    pub fn owned<const N: usize>(&self) -> [bool; N] {
+        core::array::from_fn(|ahead| {
+            let index = (self.next + ahead) % DESCRIPTORS;
+            self.descriptors.read::<u32>(index * DESCRIPTOR) & OWN != 0
+        })
+    }
+    /// How many slots the device owns.
+    pub fn device_owned(&self) -> usize {
+        (0..DESCRIPTORS)
+            .filter(|index| self.descriptors.read::<u32>(index * DESCRIPTOR) & OWN != 0)
+            .count()
     }
     pub fn available(&self) -> bool {
         self.descriptors.read::<u32>(self.next * DESCRIPTOR) & OWN == 0
@@ -105,6 +127,8 @@ impl Ring {
             let frame = received_length(status).map(|length| {
                 take(&self.buffers.bytes()[self.next * BUFFER..self.next * BUFFER + length])
             });
+            self.taken += 1;
+            self.dropped += u64::from(frame.is_none());
             self.offer(self.next);
             self.next = (self.next + 1) % DESCRIPTORS;
             if frame.is_some() {
@@ -115,11 +139,13 @@ impl Ring {
     }
 }
 /// A completed receive descriptor's frame length without the FCS, as Linux
-/// `rtl8169_rx_interrupt` decodes it: none with an error bit, none for a
-/// fragment (a frame over one buffer), and none outside 14..=1514 bytes.
+/// `rtl_rx` decodes it: none with the error summary (RxRES, which Linux's
+/// `rtl8169_check_rx_desc_error` alone tests: RWT, RUNT and CRC only say
+/// which error it was), none for a fragment (a frame over one buffer), and
+/// none outside 14..=1514 bytes.
 fn received_length(status: u32) -> Option<usize> {
     let length = (status & LENGTH) as usize;
-    (status & RX_ERRORS == 0
+    (status & RX_RES == 0
         && status & (FIRST | LAST) == FIRST | LAST
         && (18..=MAX_FRAME + 4).contains(&length))
     .then(|| length - 4)
@@ -160,9 +186,16 @@ mod tests {
         // the 14-bit length change neither the length nor the verdict.
         let above = (7 << 14) | (1 << 17) | (1 << 18) | (7 << 25) | END;
         assert_eq!(received_length(whole | above | 64), Some(60));
-        // RWT, RES, RUNT and CRC each drop the frame.
-        for bit in 19..=22 {
-            assert_eq!(received_length(whole | (1 << bit) | 64), None, "{bit}");
+        // The error summary drops the frame, with or without its reason.
+        assert_eq!(received_length(whole | RX_RES | 64), None);
+        for bit in [19, 20, 22] {
+            assert_eq!(
+                received_length(whole | RX_RES | (1 << bit) | 64),
+                None,
+                "{bit}"
+            );
+            // A reason bit without the summary is no error to Linux.
+            assert_eq!(received_length(whole | (1 << bit) | 64), Some(60), "{bit}");
         }
         // Fragments of a frame over one buffer are dropped, as Linux does.
         for fragment in [FIRST, LAST, 0] {

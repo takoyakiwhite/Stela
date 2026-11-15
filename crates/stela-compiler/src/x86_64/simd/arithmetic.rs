@@ -3,6 +3,12 @@ use crate::x86_64::asm::BitTest;
 use crate::x86_64::asm::{Alu, Code, Gpr, Rm, Size};
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod boundary_tests;
 mod half;
 #[cfg(all(
     test,
@@ -21,12 +27,11 @@ use super::numerical::{
     ArithmeticOpcode, ColdSplit, Condition, EXPONENT_VECTOR, Entry, FPSR_UNDERFLOW,
     INPUT_MINIMUM_EXPONENT, Input, LEFT_VECTOR, NanRegisters, RESULT_MINIMUM_EXPONENT,
     RIGHT_VECTOR, SINGLE_EXPONENT_BIAS_BITS, ZeroProduct, branch, clear_high_qword, clear_scalar,
-    commit_flush_status, commit_inexact, commit_inexact_divide, commit_inexact_underflow,
-    commit_invalid_lanes, commit_rounded_status, emit_opcode, environment, exponent_range,
-    flush_subnormal_lanes, fpsr_has, jump, merge_nans, minimum_normal_lanes, nonfinite_lane,
-    prepare_vector_input_range, prepare_vector_result_range, read_inputs, read_numerical_right,
-    read_numerical_vector, reject_exceptional_lanes, reject_other_status,
-    reject_other_status_but_divide, reject_other_status_but_underflow, resolve,
+    commit_flush_status, commit_inexact, commit_inexact_divide, commit_invalid_lanes,
+    commit_rounded_status, emit_opcode, environment, exponent_range, flush_subnormal_lanes,
+    fpsr_has, jump, merge_nans, minimum_normal_lanes, nonfinite_lane, prepare_vector_input_range,
+    prepare_vector_result_range, read_inputs, read_numerical_right, read_numerical_vector,
+    reject_exceptional_lanes, reject_other_status, reject_other_status_but_divide, resolve,
     restore_environment, scalar_ordered_range, scalar_range_or_zero, select_input_nans,
     small_lanes, sticky_inexact, sticky_result_check, test_control, vector_exponent_range,
     vector_normal_or_zero_range, vector_ordered_range, zero_product_check,
@@ -400,7 +405,7 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
     let zero_check = code.len();
     resolve(code, unknown, zero_check);
     // Other rejected products take the full path, which completes tiny
-    // results ([`tiny_product_status`]).
+    // results ([`rounded_path`]).
     let mut full = full;
     full.push(nonfinite);
     full.extend(zero_product_check(
@@ -423,29 +428,6 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
         inline_end,
         crossing,
     }
-}
-
-/// The full path's status of a product ([`zero_product`]) under FPCR.FZ and
-/// AH zero, when it is not `None`: results below the minimum normal
-/// complete as the host computed them (no FTZ in the environment), with
-/// MXCSR underflow as FPSR.UFC: SSE, like Arm with AH zero, detects
-/// tininess before rounding and, with underflow masked, reports it for an
-/// inexact tiny result (measured: the minimum normal times 1 - 2^-24 rounds
-/// to the minimum normal with PE and UE). Returns the branches to the
-/// success path; `helper` receives the others. With FZ or AH set (AH
-/// detects tininess after rounding), the caller's checks follow.
-fn tiny_product_status(
-    code: &mut Code,
-    operand: &Operand,
-    helper: &mut Vec<usize>,
-) -> Option<(Vec<usize>, usize)> {
-    if !zero_product(operand.operation) {
-        return None;
-    }
-    test_control(code, FPCR_FZ | FPCR_AH);
-    let strict = branch(code, Condition::NotZero);
-    helper.push(reject_other_status_but_underflow(code));
-    Some((vec![jump(code)], strict))
 }
 
 /// The full path with FPCR.FZ, FIZ and AH clear: subnormal inputs and
@@ -501,15 +483,17 @@ fn rounded_path(code: &mut Code, operand: &Operand, right: u8, helper: &mut Vec<
         NAN_REGISTERS,
     );
     // These lanes take the helper: FMULX's infinity times zero, two rather
-    // than the default NaN; a quotient rounded to the minimum normal (sums
-    // are exact when tiny, and products find tininess before rounding, but
-    // a quotient's is not known); and under FZ a result Arm flushes.
+    // than the default NaN; a product or quotient rounded to the minimum
+    // normal, which may be tiny before rounding (Arm, AH clear) but not
+    // after (the host), so the host's underflow status does not tell
+    // UFC, nor under FZ whether Arm flushes it (sums are exact when
+    // tiny); and under FZ a quotient Arm flushes.
     let checked = HELPER_LANES;
     packed(code, Host::Xor, checked, checked);
     if operand.operation == BinaryOperation::MultiplyExtended {
         packed(code, Host::Or, checked, NAN_REGISTERS.mask);
     }
-    if operand.operation == BinaryOperation::Divide {
+    if divide || zero_product(operand.operation) {
         minimum_normal_lanes(code, operand.format, LEFT_VECTOR, MINIMUM_SCRATCH);
         packed(code, Host::Or, checked, MINIMUM_SCRATCH[0]);
     }
@@ -545,9 +529,9 @@ fn rounded_path(code: &mut Code, operand: &Operand, right: u8, helper: &mut Vec<
 /// environment, after the operation: a nonzero result below the minimum
 /// normal is tiny, and so is a zero product of nonzero inputs (`saved`
 /// holds the flushed left input), which the host rounded to zero. A product
-/// rounded to the minimum normal is tiny exactly when inexact, which only
-/// the host's underflow status tells: [`reject_flushed_underflow`] sends
-/// it to the helper. A sum tiny before rounding is exact. The flushed lanes
+/// rounded to the minimum normal may be tiny before rounding, which the
+/// host (tininess after rounding) does not tell: [`rounded_path`] sends
+/// those lanes to the helper. A sum tiny before rounding is exact. The flushed lanes
 /// add UFC to R11D and give up their host status: a scalar has none left,
 /// and a vector reruns the operation with those lanes' inputs zero for the
 /// other lanes' status. Clobbers XMM2, XMM5, XMM7, `saved`, `right` and
@@ -705,11 +689,6 @@ fn emit_scalar(
     );
     restore_environment(code);
     // Caller environment and stack are restored before every branch from here.
-    let tiny = tiny_product_status(code, operand, &mut helper);
-    if let Some((_, strict)) = &tiny {
-        let strict_start = code.len();
-        resolve(code, *strict, strict_start);
-    }
     helper.push(reject_status(code, operand));
     let success = if accepts_zero(operand.operation) {
         helper.push(scalar_ordered_range(
@@ -739,7 +718,7 @@ fn emit_scalar(
         resolve(code, patch, helper_start);
     }
     resolve(code, success, success_start);
-    commit_status(code, operand, success_start, tiny);
+    commit_status(code, operand);
     commit_flush_status(code);
     let tail = code.len();
     resolve(code, rounded, tail);
@@ -757,23 +736,14 @@ fn emit_scalar(
     finish(code, sticky, full, operand)
 }
 
-/// Resolve the tiny-product successes ([`tiny_product_status`]) to
-/// `success_start`, and commit the status of the full path.
-fn commit_status(
-    code: &mut Code,
-    operand: &Operand,
-    success_start: usize,
-    tiny: Option<(Vec<usize>, usize)>,
-) {
-    match tiny {
-        Some((successes, _)) => {
-            for patch in successes {
-                resolve(code, patch, success_start);
-            }
-            commit_inexact_underflow(code);
-        }
-        None if zero_quotient(operand) => commit_inexact_divide(code),
-        None => commit_inexact(code),
+/// Commit the status of the full path's alternative (FPCR.AH) part, whose
+/// results are normal or exact: a tiny or underflowing result took the
+/// helper.
+fn commit_status(code: &mut Code, operand: &Operand) {
+    if zero_quotient(operand) {
+        commit_inexact_divide(code);
+    } else {
+        commit_inexact(code);
     }
 }
 
@@ -860,11 +830,6 @@ fn emit_vector(
         right,
     );
     restore_environment(code);
-    let tiny = tiny_product_status(code, operand, &mut helper);
-    if let Some((_, strict)) = &tiny {
-        let strict_start = code.len();
-        resolve(code, *strict, strict_start);
-    }
     helper.push(reject_status(code, operand));
     prepare_vector_result_range(code);
     if accepts_zero(operand.operation) {
@@ -895,7 +860,7 @@ fn emit_vector(
         resolve(code, patch, helper_start);
     }
     resolve(code, success, success_start);
-    commit_status(code, operand, success_start, tiny);
+    commit_status(code, operand);
     commit_flush_status(code);
     let tail = code.len();
     resolve(code, rounded, tail);

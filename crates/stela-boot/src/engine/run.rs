@@ -915,6 +915,9 @@ pub(super) fn run<H: Host>(
         let sliced = waiting || matches!(stop, Stop::Budget) && !budget_reached;
         let now = host::rdtsc();
         if !sliced {
+            // Every guest line, the last ones before the stop first of all.
+            let taken = machine.devices.with(|_| super::take_guest_output());
+            super::write_guest_output(taken, || true);
             service.report(tsc_hz);
             // The interval before the stop, which no beat reports: whether a
             // PE was kept from guest code, and whether the count held for it.
@@ -1022,6 +1025,10 @@ fn calm<H: Host>(machine: &Machine<H, parallel::Board>, quiet: bool) -> super::g
     }
 }
 
+/// The longest the boot PE writes the guest's console lines for between
+/// two slices; the rest wait for the next.
+const GUEST_OUTPUT_MICROS: u64 = 250;
+
 /// Report what the PEs' device accesses left since the last slice: the
 /// guest's console and the installer's step, the boot's progress, and the
 /// unmodeled requests and device logs.
@@ -1032,6 +1039,11 @@ pub(super) fn report_drained<H: Host>(
     now: u64,
     tsc_hz: u64,
 ) {
+    let started = host::rdtsc();
+    let budget = tsc_hz / 1_000_000 * GUEST_OUTPUT_MICROS;
+    super::write_guest_output(drained.guest, || {
+        host::rdtsc().wrapping_sub(started) < budget
+    });
     let lines = drained.lines;
     if let Some(step) = lines.iter().rev().find_map(|line| installer_step(line)) {
         crate::status::progress(&step);
@@ -1276,6 +1288,9 @@ pub(super) struct Heartbeat {
     /// The beat's reports still to run, one stage per service boundary
     /// ([`Self::step`]), and what its stages took so far.
     pub(super) stage: Option<BeatStage>,
+    /// The `PES STAMPED` line the processors' report made, which the
+    /// last profile part ends ([`Self::profile_part`]).
+    stamped: Option<(String, u64, u64)>,
     pub(super) cost: BeatCost,
     /// The hardware counters at the last `PES PMU` line (`host::pmu`).
     pub(super) pmu: host::pmu::Seen,
@@ -1290,6 +1305,9 @@ pub(super) struct Heartbeat {
 /// order. Each runs at its own service boundary, so none holds the boot PE
 /// long; the walks of every block go on in steps of [`STEP_MICROS`].
 pub(super) enum BeatStage {
+    /// The `--profile` reports of the beat's processors, a part a step,
+    /// then the stamped line ([`Heartbeat::profile_part`]).
+    Profile(u8),
     /// The exits by instruction word, then their change since the last beat
     /// and the exit, translated and shadow lines.
     Exits(stela_engine::machine::engine::ExitWordsWalk),
@@ -1343,6 +1361,7 @@ impl Heartbeat {
             sliced_ticks: 0,
             timing: machine.step_timing().copied(),
             stage: None,
+            stamped: None,
             cost: BeatCost::new(),
             pmu: host::pmu::Seen::new(),
             dynamic: Default::default(),
@@ -1423,7 +1442,7 @@ impl Heartbeat {
         cost.step(at.wrapping_sub(now));
         self.cost = cost;
         self.beats += 1;
-        self.stage = Some(BeatStage::Exits(Default::default()));
+        self.stage = Some(BeatStage::Profile(0));
     }
 
     /// Run the beat's next stage, or the next step of its walk, for about
@@ -1436,6 +1455,14 @@ impl Heartbeat {
         let budget = tsc_hz / 1_000_000 * STEP_MICROS;
         let more = || host::rdtsc().wrapping_sub(started) < budget;
         let (name, next) = match stage {
+            BeatStage::Profile(part) => {
+                let next = if self.profile_part(machine, part, tsc_hz) {
+                    BeatStage::Profile(part + 1)
+                } else {
+                    BeatStage::Exits(Default::default())
+                };
+                ("profile", Some(next))
+            }
             // The walk of every block costs about 16 ms a beat on a booted
             // desktop: it runs only while profiling.
             BeatStage::Exits(_) if machine.step_timing().is_none() => (
@@ -1618,6 +1645,55 @@ impl Heartbeat {
         self.stage = next;
         if self.stage.is_none() {
             self.cost.report(tsc_hz);
+        }
+    }
+
+    /// Part `part` of the beat's `--profile` reports, the stamped line after
+    /// the last; whether more parts follow. Without `--profile`, only the
+    /// stamped line.
+    fn profile_part<H: Host>(
+        &mut self,
+        machine: &mut Machine<H, parallel::Board>,
+        part: u8,
+        tsc_hz: u64,
+    ) -> bool {
+        let profiling = machine.step_timing().is_some();
+        match part {
+            0 if profiling => {
+                let exits = parallel::system_exits(machine);
+                system_exits_report(&exits, tsc_hz);
+                barrier_waits_report(&exits.barriers, tsc_hz);
+                regime_syncs_report(&exits.regimes, tsc_hz);
+                device_exits_report(machine, &exits.devices, tsc_hz);
+                true
+            }
+            1 if profiling => {
+                transfer_times_report(machine, tsc_hz);
+                aic_counts_report(machine);
+                write_times_report(machine, tsc_hz);
+                true
+            }
+            _ => {
+                if profiling {
+                    hot_blocks_report(
+                        machine,
+                        &mut self.dynamic,
+                        &mut self.hot_total,
+                        self.beats.is_multiple_of(HOT_TOTAL_BEATS),
+                    );
+                }
+                if let Some((mut line, predicted, pac_fills)) = self.stamped.take() {
+                    if profiling {
+                        line.push_str(&dynamic_sites(&self.dynamic));
+                    }
+                    // Exits of PAC branch thunks given a predicted tail this beat.
+                    line.push_str(&format!(" predicted={predicted}"));
+                    // PAC results computed this beat, all PEs: memo misses.
+                    line.push_str(&format!(" pac_fills={pac_fills}"));
+                    output::arguments(format_args!("{line}\n"));
+                }
+                false
+            }
         }
     }
 
@@ -2147,32 +2223,9 @@ impl Heartbeat {
                 output::arguments(format_args!("{line}\n"));
             }
         }
-        if machine.step_timing().is_some() {
-            let exits = parallel::system_exits(machine);
-            system_exits_report(&exits, tsc_hz);
-            barrier_waits_report(&exits.barriers, tsc_hz);
-            regime_syncs_report(&exits.regimes, tsc_hz);
-            device_exits_report(machine, &exits.devices, tsc_hz);
-            transfer_times_report(machine, tsc_hz);
-            aic_counts_report(machine);
-            write_times_report(machine, tsc_hz);
-            hot_blocks_report(
-                machine,
-                &mut self.dynamic,
-                &mut self.hot_total,
-                self.beats.is_multiple_of(HOT_TOTAL_BEATS),
-            );
-        }
-        if let Some((mut line, predicted, pac_fills)) = stamped_line {
-            if machine.step_timing().is_some() {
-                line.push_str(&dynamic_sites(&self.dynamic));
-            }
-            // Exits of PAC branch thunks given a predicted tail this beat.
-            line.push_str(&format!(" predicted={predicted}"));
-            // PAC results computed this beat, all PEs: memo misses.
-            line.push_str(&format!(" pac_fills={pac_fills}"));
-            output::arguments(format_args!("{line}\n"));
-        }
+        // The `--profile` reports and the line that ends with what they
+        // gathered follow in stages of their own ([`BeatStage::Profile`]).
+        self.stamped = stamped_line;
         // Self-loops since boot, every PE together: compiled, then with
         // `--profile` their entries and the instructions their iterations
         // retired past each entry's first (0/0 without it).
