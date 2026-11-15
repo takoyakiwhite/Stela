@@ -110,7 +110,7 @@ pub struct Attachment {
 
 /// NVK's explicit linear layouts need 32-byte row pitches on Maxwell B and
 /// later (NIL `Image::new_linear`).
-const LINEAR_ROW_ALIGNMENT: u64 = 32;
+pub(crate) const LINEAR_ROW_ALIGNMENT: u64 = 32;
 /// NIL aligns linear images of an explicit row pitch to 32 bytes on Maxwell B
 /// and later, and NVK binds an image without a PTE kind at its memory's
 /// address plus the offset (`nvk_image_plane_bind`), mapping no pages of its

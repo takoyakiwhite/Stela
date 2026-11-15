@@ -44,6 +44,8 @@ use core::ops::Range;
 use core::ptr::{self, NonNull};
 use stela_contracts::{Refusal, refuse};
 
+use crate::metal::nvidia::LINEAR_ROW_ALIGNMENT;
+
 /// `_IOWR('d', number, T)`.
 const fn request<T>(number: u32) -> u32 {
     3 << 30 | (size_of::<T>() as u32) << 16 | 0x64 << 8 | number
@@ -630,6 +632,19 @@ fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
     across.abs_diff(down) * 100 <= down
 }
 
+/// Whether a mode of this size can be presented at all. The GPU's linear
+/// images need a row pitch that is a multiple of
+/// [`LINEAR_ROW_ALIGNMENT`], and the guest's display surface has a plane one
+/// byte an element wide, so its row pitch is the mode's width. A mode whose
+/// width is not a multiple of the alignment can therefore never be
+/// presented: the Metal device refuses the surface's texture, the guest's
+/// `WindowServer` has no texture for the screen and stops, and it is
+/// restarted and stops again. Such a mode is passed over for one the GPU can
+/// present.
+fn presentable(size: (u32, u32)) -> bool {
+    u64::from(size.0) % LINEAR_ROW_ALIGNMENT == 0
+}
+
 /// The size the connected `outputs`, each its modes, show the picture in,
 /// and which of them gives the mode the guest is told of.
 ///
@@ -640,7 +655,9 @@ fn same_shape(a: (u32, u32), b: (u32, u32)) -> bool {
 /// 5120x1440, so gives way to the largest of its shape that it can, as
 /// 3840x1080, before a firmware's 1920x1080 stretched across it. A size
 /// with a mode the guest can be told of beats one
-/// without. Then [`Wanted::Size`]'s size wins, as only it is shown; for
+/// without. A size the GPU can present beats one it cannot, as the guest
+/// cannot show a mode whose surface it refuses to make a texture of. Then
+/// [`Wanted::Size`]'s size wins, as only it is shown; for
 /// [`Wanted::Native`] the size most outputs run wins, so every monitor
 /// shows the picture where they share a size, as Linux's fbdev helper
 /// clones in a common mode. Earlier sizes win ties. The output that gives
@@ -702,7 +719,7 @@ fn plan(outputs: &[&[ModeInfo]], wanted: Wanted, fits: Fits<'_>) -> Option<((u32
         .max_by_key(|&(order, &size)| {
             let told = outputs.iter().any(|modes| fitting(modes, size));
             let rank = match wanted {
-                Wanted::Native(_) => (told, false, covered(size)),
+                Wanted::Native(_) => (told, presentable(size), covered(size)),
                 Wanted::Size(only) => (told, size == only, 0),
             };
             (rank, core::cmp::Reverse(order))

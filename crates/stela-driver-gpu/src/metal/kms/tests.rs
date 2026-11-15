@@ -399,6 +399,38 @@ fn a_mode_the_guest_cannot_be_told_of_is_passed_over() {
     );
 }
 
+/// A mode whose width is not a multiple of the row pitch the GPU's linear
+/// images need can never be presented: the guest's display surface has a
+/// plane one byte an element wide, the Metal device refuses the surface's
+/// texture, and the guest's `WindowServer` stops. Such a mode is passed
+/// over for one the GPU can present.
+#[test]
+fn a_mode_the_gpu_cannot_present_is_passed_over() {
+    let modes = [
+        mode(2560, 1600, PREFERRED),
+        mode(1680, 1050, 0),
+        mode(1920, 1200, 0),
+    ];
+    let any: Fits<'_> = &|_, _, _| true;
+    // The panel's own mode is one the GPU can present, and it wins.
+    assert_eq!(
+        choose(&modes, Wanted::Native((2560, 1600)), any),
+        Some(modes[0])
+    );
+    // Without a preferred mode, the mode the GPU cannot present is passed
+    // over for the one it can.
+    assert_eq!(
+        choose(&modes[1..], Wanted::Native((1680, 1050)), any),
+        Some(modes[2])
+    );
+    // With no mode the GPU can present, one is taken as before.
+    let only = [mode(1366, 768, PREFERRED)];
+    assert_eq!(
+        choose(&only, Wanted::Native((1366, 768)), any),
+        Some(only[0])
+    );
+}
+
 #[test]
 fn the_connected_output_runs_on_a_controller_it_can_reach() {
     let modes = vec![mode(4, 2, PREFERRED)];
