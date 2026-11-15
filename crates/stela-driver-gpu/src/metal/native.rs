@@ -1608,7 +1608,7 @@ impl NativeBackend {
                 .map_err(|(_, error)| failure(error))
             })
         })?;
-        deferral::CREATED.note((self.ticks)().wrapping_sub(started));
+        deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
         self.report_executables(pipeline);
         Ok(pipeline)
     }
@@ -2716,7 +2716,7 @@ impl Backend for NativeBackend {
                 .map_err(|(_, error)| failure(error))
             })
         });
-        deferral::CREATED.note((self.ticks)().wrapping_sub(started));
+        deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
         created.map(|pipeline| {
             self.report_executables(pipeline);
             Pipeline(raw(pipeline))
@@ -2762,8 +2762,8 @@ impl Backend for NativeBackend {
     }
 
     fn pipeline_cache_data(&mut self, cache: PipelineCache) -> Result<Vec<u8>> {
-        // SAFETY: the cache is alive and the service creates no pipeline
-        // meanwhile.
+        // SAFETY: the cache is alive and internally synchronized: a job may
+        // create through it meanwhile.
         unsafe { self.device.get_pipeline_cache_data(handle(cache.0)) }.map_err(failure)
     }
 
@@ -2891,9 +2891,11 @@ impl Backend for NativeBackend {
                 Object::Pipeline(pipeline) => {
                     self.device.destroy_pipeline(handle(pipeline.0), None);
                 }
-                Object::PipelineCache(cache) => {
+                // A job creating through it destroys it once done.
+                Object::PipelineCache(cache) if !self.cache_in_use(handle(cache.0)) => {
                     self.device.destroy_pipeline_cache(handle(cache.0), None);
                 }
+                Object::PipelineCache(_) => {}
                 Object::QueryPool(pool) => self.device.destroy_query_pool(handle(pool.0), None),
                 Object::Semaphore(semaphore) => {
                     // After the turn when the outside work takes it, as the
