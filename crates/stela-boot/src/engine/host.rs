@@ -69,9 +69,9 @@ use faults::*;
 pub(crate) use faults::{native_exception, page_fault};
 pub(crate) use signals::{
     clear_interrupted, completion_signal, device_signals, doorbell_counter, doorbells,
-    in_interrupt, interrupted, join_shootdown, network_interrupt, network_signal, nmi, ring,
-    root_irq_active, shootdown, shootdown_interrupt, signal_interrupt, sleep_for,
-    take_network_signal, undelivered_doorbells, wake_interrupt,
+    end_stale_in_service, in_interrupt, interrupted, join_shootdown, network_interrupt,
+    network_signal, nmi, ring, root_irq_active, shootdown, shootdown_interrupt, signal_interrupt,
+    sleep_for, stale_in_service_report, take_network_signal, undelivered_doorbells, wake_interrupt,
 };
 pub use signals::{spurious_interrupt, stray_interrupt, timer_interrupt};
 #[cfg(feature = "diagnostics")]
@@ -83,9 +83,9 @@ use stela_boot_core::ram;
 mod translated;
 pub(crate) use local::activated_base;
 pub(crate) use local::context::RootIdentity;
-#[cfg(feature = "nvk")]
-pub(crate) use local::processor;
 use local::state;
+#[cfg(feature = "nvk")]
+pub(crate) use local::{processor, processors};
 
 /// Calls `action` with each host run behind `bytes` of guest RAM at `guest`, as
 /// (host physical, bytes). False, partway, if part of it is not RAM.

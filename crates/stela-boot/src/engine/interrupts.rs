@@ -12,11 +12,18 @@ mod saved_state;
 pub(crate) use saved_state::SavedState;
 pub(crate) type Handler = for<'image> extern "sysv64" fn(&mut Frame, &SavedState<'image>);
 
-pub const TIMER_VECTOR: u8 = 0x40;
-/// Native worker doorbell; host-device IRQs own 0x50..=0x5f.
-pub(crate) const NATIVE_WAKE_VECTOR: u8 = 0x60;
-/// The MMIO aperture's TLB shootdown (`native_mmio::shootdown`).
-pub(crate) const SHOOTDOWN_VECTOR: u8 = 0x61;
+/// The engine's local APIC timer, in a priority class above every device
+/// and completion vector, as Linux's `LOCAL_TIMER_VECTOR` (0xec,
+/// arch/x86/include/asm/irq_vectors.h): a device vector left in service, or
+/// one that keeps coming, cannot hold it off. Below it the timer waited
+/// behind any of them, and one left in service stopped it for good.
+pub const TIMER_VECTOR: u8 = 0xec;
+/// Native worker doorbell, above the timer as Linux's reschedule IPI
+/// (0xfd); host-device IRQs own 0x50..=0x5f.
+pub(crate) const NATIVE_WAKE_VECTOR: u8 = 0xfd;
+/// The MMIO aperture's TLB shootdown (`native_mmio::shootdown`), above the
+/// timer as Linux's function-call IPI (0xfb) that its TLB shootdowns use.
+pub(crate) const SHOOTDOWN_VECTOR: u8 = 0xfb;
 /// A host device's completion signal (`host::completion_signal`): a
 /// doorbell that also counts the signals apart from other cores' doorbells.
 pub(crate) const SIGNAL_VECTOR: u8 = 0x62;
@@ -313,6 +320,55 @@ extern "sysv64" fn terminal_interrupt(frame: *mut Frame, image: *const u8) -> ! 
     saved_state::terminal(frame, image)
 }
 
+// The NMI gate: an NMI a TLB shootdown sent (`native_mmio::shootdown`) is
+// answered and returns; any other goes on to vector 2's terminal stub with
+// the stack as the processor left it. The answer runs soft-float Rust that
+// takes no lock and touches no extended state, on the NMI's own stack, so it
+// saves only the registers the call may clobber. The processor's frame
+// leaves RSP 8 bytes past a 16-byte boundary and nine pushes realign it.
+global_asm!(
+    r#"
+.global stela_nmi_gate
+stela_nmi_gate:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    cld
+    mov rdi, [rsp + 72]
+    call {answer}
+    test al, al
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    jz stela_vector_2
+    iretq
+"#,
+    answer = sym nmi_answer,
+);
+
+/// Whether the NMI at `rip` was a shootdown's, now answered: the gate then
+/// returns. The step watchdog's keeps its stop even when a shootdown's came
+/// with it, as two NMIs pending at once are taken as one.
+extern "sysv64" fn nmi_answer(rip: u64) -> bool {
+    if !crate::native_mmio::shootdown::take_poke() || super::step_watchdog::nmi_is_watchdog() {
+        return false;
+    }
+    crate::native_mmio::shootdown::answer_nmi(rip);
+    true
+}
+
 // One stub per vector: push a zero error code when the CPU pushes none,
 // then the vector, and join the common path. The table lists them in order.
 macro_rules! vectors {
@@ -350,7 +406,7 @@ vectors!(
     64 none,
     80 none, 81 none, 82 none, 83 none, 84 none, 85 none, 86 none, 87 none,
     88 none, 89 none, 90 none, 91 none, 92 none, 93 none, 94 none, 95 none,
-    96 none, 97 none, 98 none, 99 none, 255 none,
+    96 none, 97 none, 98 none, 99 none, 236 none, 251 none, 253 none, 255 none,
 );
 
 /// Whether the table gives `vector` a stub, and so a gate: an interrupt on
@@ -373,9 +429,22 @@ const _: () = assert!(
         && has_stub(NETWORK_VECTOR)
         && has_stub(SPURIOUS_VECTOR)
 );
+// The timer's class is above every device and completion vector's, so none
+// of them in service holds it off; the doorbell's and the shootdown's are
+// above the timer's, so a compile job's task priority can block the timer
+// and still take them (`native_mmio::shootdown::JOB_PRIORITY`).
+const _: () = assert!(
+    TIMER_VECTOR >> 4 > 0x5f >> 4
+        && TIMER_VECTOR >> 4 > SIGNAL_VECTOR >> 4
+        && TIMER_VECTOR >> 4 > NETWORK_VECTOR >> 4
+        && NATIVE_WAKE_VECTOR >> 4 > TIMER_VECTOR >> 4
+        && SHOOTDOWN_VECTOR >> 4 > TIMER_VECTOR >> 4
+        && TIMER_VECTOR < SPURIOUS_VECTOR
+);
 
 unsafe extern "C" {
     static stela_vector_table: [usize; VECTOR_NUMBERS.len()];
+    fn stela_nmi_gate();
 }
 
 fn gate(handler: usize, ist: u8) -> [u64; 2] {
@@ -535,6 +604,8 @@ pub(crate) unsafe fn install_on(tables: &'static mut Tables, handler: Handler) {
             let ist = if matches!(vector, 2 | 8 | 18) { 2 } else { 1 };
             (*idt)[vector] = gate(handler, ist);
         }
+        // An NMI first asks whether a shootdown sent it, then reaches its stub.
+        (*idt)[2] = gate(stela_nmi_gate as *const () as usize, 2);
         let pointer = Pointer {
             limit: (size_of::<[[u64; 2]; 256]>() - 1) as u16,
             base: idt as u64,
@@ -558,6 +629,8 @@ fn cr3() -> u64 {
 }
 
 pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_>) {
+    // A processor woken from an idle wait flushes what it skipped first.
+    crate::native_mmio::shootdown::wake();
     if crate::native_irq::dispatch(frame.vector as u8) {
         return;
     }
