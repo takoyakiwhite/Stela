@@ -1082,23 +1082,6 @@ static BOOL claims(const StelaBlock *capabilities, NSInteger family)
 
 - (BOOL)supportsFamily:(NSInteger)family
 {
-	/* EXPERIMENTAL: macOS 27.2 (26B123) on the M2 Mac mini Stela presents
-	 * probes the Apple8..Apple11 families from WindowServer, Language
-	 * Chooser, QuartzCore and MPS. The host driver derives capabilities only
-	 * through Apple7, so answering NO makes each caller report an unclaimed
-	 * family and take a path that draws nothing even though DCP keeps
-	 * presenting ~42 frames/s. Claim those four families without changing
-	 * the capability block: the private feature queries below still answer
-	 * from Apple4/6/7 and the host's Metal3 compiler is unchanged. If the
-	 * screen stays black with this, the cause is elsewhere and this change
-	 * must be reverted. */
-	if (family >= MTLGPUFamilyApple8 && family <= MTLGPUFamilyApple11) {
-		static _Atomic bool announced = false;
-		if (!atomic_exchange(&announced, true)) {
-			NSLog(@"StelaGPU: claiming Apple8-Apple11 on an Apple7 host (experimental)");
-		}
-		return YES;
-	}
 	BOOL claimed = claims(_capabilities, family);
 	if (!claimed) {
 		report_unclaimed("GPU family", family, __builtin_return_address(0));
